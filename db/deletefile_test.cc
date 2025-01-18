@@ -7,9 +7,7 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
 
-
-#include <stdlib.h>
-
+#include <cstdlib>
 #include <map>
 #include <string>
 #include <vector>
@@ -106,7 +104,7 @@ class DeleteFileTest : public DBTestBase {
     ASSERT_OK(env_->GetChildren(dir, &filenames));
 
     int log_cnt = 0, sst_cnt = 0, manifest_cnt = 0;
-    for (auto file : filenames) {
+    for (const auto& file : filenames) {
       uint64_t number;
       FileType type;
       if (ParseFileName(file, &number, &type)) {
@@ -127,7 +125,7 @@ class DeleteFileTest : public DBTestBase {
   }
 
   static void DoSleep(void* arg) {
-    auto test = reinterpret_cast<DeleteFileTest*>(arg);
+    auto test = static_cast<DeleteFileTest*>(arg);
     test->env_->SleepForMicroseconds(2 * 1000 * 1000);
   }
 
@@ -148,9 +146,9 @@ TEST_F(DeleteFileTest, AddKeysAndQueryLevels) {
   std::vector<LiveFileMetaData> metadata;
   db_->GetLiveFilesMetaData(&metadata);
 
-  std::string level1file = "";
+  std::string level1file;
   int level1keycount = 0;
-  std::string level2file = "";
+  std::string level2file;
   int level2keycount = 0;
   int level1index = 0;
   int level2index = 1;
@@ -176,15 +174,15 @@ TEST_F(DeleteFileTest, AddKeysAndQueryLevels) {
   ASSERT_EQ(level1keycount, 50000);
   ASSERT_EQ(level2keycount, 50000);
 
-  Status status = db_->DeleteFile("0.sst");
+  Status status = db_->DEPRECATED_DeleteFile("0.sst");
   ASSERT_TRUE(status.IsInvalidArgument());
 
   // intermediate level files cannot be deleted.
-  status = db_->DeleteFile(level1file);
+  status = db_->DEPRECATED_DeleteFile(level1file);
   ASSERT_TRUE(status.IsInvalidArgument());
 
   // Lowest level file deletion should succeed.
-  status = db_->DeleteFile(level2file);
+  status = db_->DEPRECATED_DeleteFile(level2file);
   ASSERT_OK(status);
 }
 
@@ -222,6 +220,49 @@ TEST_F(DeleteFileTest, PurgeObsoleteFilesTest) {
   CheckFileTypeCounts(dbname_, 0, 3, 1);
   delete itr;
   // 1 sst after iterator deletion
+  CheckFileTypeCounts(dbname_, 0, 1, 1);
+}
+
+TEST_F(DeleteFileTest, WaitForCompactWithWaitForPurgeOptionTest) {
+  Options options = CurrentOptions();
+  SetOptions(&options);
+  Destroy(options);
+  options.create_if_missing = true;
+  Reopen(options);
+
+  std::string first("0"), last("999999");
+  CompactRangeOptions compact_options;
+  compact_options.change_level = true;
+  compact_options.target_level = 2;
+  Slice first_slice(first), last_slice(last);
+
+  CreateTwoLevels();
+  Iterator* itr = nullptr;
+  ReadOptions read_options;
+  read_options.background_purge_on_iterator_cleanup = true;
+  itr = db_->NewIterator(read_options);
+  ASSERT_OK(itr->status());
+  ASSERT_OK(db_->CompactRange(compact_options, &first_slice, &last_slice));
+  SyncPoint::GetInstance()->LoadDependency(
+      {{"DBImpl::BGWorkPurge:start", "DeleteFileTest::WaitForPurgeTest"},
+       {"DBImpl::WaitForCompact:InsideLoop",
+        "DBImpl::BackgroundCallPurge:beforeMutexLock"}});
+  SyncPoint::GetInstance()->EnableProcessing();
+
+  delete itr;
+
+  TEST_SYNC_POINT("DeleteFileTest::WaitForPurgeTest");
+  // At this point, purge got started, but can't finish due to sync points
+  // not purged yet
+  CheckFileTypeCounts(dbname_, 0, 3, 1);
+
+  // The sync point in WaitForCompact should unblock the purge
+  WaitForCompactOptions wait_for_compact_options;
+  wait_for_compact_options.wait_for_purge = true;
+  Status s = dbfull()->WaitForCompact(wait_for_compact_options);
+  ASSERT_OK(s);
+
+  // Now files should be purged
   CheckFileTypeCounts(dbname_, 0, 1, 1);
 }
 
@@ -478,7 +519,7 @@ TEST_F(DeleteFileTest, DeleteFileWithIterator) {
     level2file = metadata[0].name;
   }
 
-  Status status = db_->DeleteFile(level2file);
+  Status status = db_->DEPRECATED_DeleteFile(level2file);
   fprintf(stdout, "Deletion status %s: %s\n", level2file.c_str(),
           status.ToString().c_str());
   ASSERT_OK(status);
@@ -510,7 +551,7 @@ TEST_F(DeleteFileTest, DeleteLogFiles) {
   ASSERT_OK(env_->FileExists(wal_dir_ + "/" + alive_log->PathName()));
   fprintf(stdout, "Deleting alive log file %s\n",
           alive_log->PathName().c_str());
-  ASSERT_NOK(db_->DeleteFile(alive_log->PathName()));
+  ASSERT_NOK(db_->DEPRECATED_DeleteFile(alive_log->PathName()));
   ASSERT_OK(env_->FileExists(wal_dir_ + "/" + alive_log->PathName()));
   logfiles.clear();
 
@@ -528,7 +569,7 @@ TEST_F(DeleteFileTest, DeleteLogFiles) {
   ASSERT_OK(env_->FileExists(wal_dir_ + "/" + archived_log->PathName()));
   fprintf(stdout, "Deleting archived log file %s\n",
           archived_log->PathName().c_str());
-  ASSERT_OK(db_->DeleteFile(archived_log->PathName()));
+  ASSERT_OK(db_->DEPRECATED_DeleteFile(archived_log->PathName()));
   ASSERT_TRUE(
       env_->FileExists(wal_dir_ + "/" + archived_log->PathName()).IsNotFound());
 }
@@ -564,8 +605,8 @@ TEST_F(DeleteFileTest, DeleteNonDefaultColumnFamily) {
   auto new_file = metadata[0].smallest_seqno > metadata[1].smallest_seqno
                       ? metadata[0].name
                       : metadata[1].name;
-  ASSERT_TRUE(db_->DeleteFile(new_file).IsInvalidArgument());
-  ASSERT_OK(db_->DeleteFile(old_file));
+  ASSERT_TRUE(db_->DEPRECATED_DeleteFile(new_file).IsInvalidArgument());
+  ASSERT_OK(db_->DEPRECATED_DeleteFile(old_file));
 
   {
     std::unique_ptr<Iterator> itr(db_->NewIterator(ReadOptions(), handles_[1]));
@@ -602,4 +643,3 @@ int main(int argc, char** argv) {
   RegisterCustomObjects(argc, argv);
   return RUN_ALL_TESTS();
 }
-

@@ -3,7 +3,6 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
 
-
 #include "table/plain/plain_table_reader.h"
 
 #include <string>
@@ -87,7 +86,6 @@ class PlainTableIterator : public InternalIterator {
   Status status_;
 };
 
-extern const uint64_t kPlainTableMagicNumber;
 PlainTableReader::PlainTableReader(
     const ImmutableOptions& ioptions,
     std::unique_ptr<RandomAccessFileReader>&& file,
@@ -126,7 +124,7 @@ Status PlainTableReader::Open(
   }
 
   std::unique_ptr<TableProperties> props;
-  // TODO: plumb Env::IOActivity
+  // TODO: plumb Env::IOActivity, Env::IOPriority
   const ReadOptions read_options;
   auto s = ReadTableProperties(file.get(), file_size, kPlainTableMagicNumber,
                                ioptions, read_options, &props);
@@ -202,8 +200,10 @@ InternalIterator* PlainTableReader::NewIterator(
   assert(table_properties_);
 
   // Auto prefix mode is not implemented in PlainTable.
-  bool use_prefix_seek = !IsTotalOrderMode() && !options.total_order_seek &&
-                         !options.auto_prefix_mode;
+  bool use_prefix_seek =
+      !IsTotalOrderMode() &&
+      (options.prefix_same_as_start ||
+       (!options.total_order_seek && !options.auto_prefix_mode));
   if (arena == nullptr) {
     return new PlainTableIterator(this, use_prefix_seek);
   } else {
@@ -300,7 +300,7 @@ Status PlainTableReader::PopulateIndex(TableProperties* props,
 
   BlockContents index_block_contents;
 
-  // TODO: plumb Env::IOActivity
+  // TODO: plumb Env::IOActivity, Env::IOPriority
   const ReadOptions read_options;
   Status s =
       ReadMetaBlock(file_info_.file.get(), nullptr /* prefetch_buffer */,
@@ -615,8 +615,12 @@ Status PlainTableReader::Get(const ReadOptions& /*ro*/, const Slice& target,
     // can we enable the fast path?
     if (internal_comparator_.Compare(found_key, parsed_target) >= 0) {
       bool dont_care __attribute__((__unused__));
-      if (!get_context->SaveValue(found_key, found_value, &dont_care,
-                                  dummy_cleanable_.get())) {
+      bool ret = get_context->SaveValue(found_key, found_value, &dont_care, &s,
+                                        dummy_cleanable_.get());
+      if (!s.ok()) {
+        return s;
+      }
+      if (!ret) {
         break;
       }
     }

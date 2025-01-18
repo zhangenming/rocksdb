@@ -130,7 +130,7 @@ namespace {}  // namespace
 TEST_F(DBBenchTest, OptionsFile) {
   const std::string kOptionsFileName = test_path_ + "/OPTIONS_test";
   Options opt = GetDefaultOptions();
-  ASSERT_OK(PersistRocksDBOptions(DBOptions(opt), {"default"},
+  ASSERT_OK(PersistRocksDBOptions(WriteOptions(), DBOptions(opt), {"default"},
                                   {ColumnFamilyOptions(opt)}, kOptionsFileName,
                                   opt.env->GetFileSystem().get()));
 
@@ -149,7 +149,7 @@ TEST_F(DBBenchTest, OptionsFileUniversal) {
 
   Options opt = GetDefaultOptions(kCompactionStyleUniversal, 1);
 
-  ASSERT_OK(PersistRocksDBOptions(DBOptions(opt), {"default"},
+  ASSERT_OK(PersistRocksDBOptions(WriteOptions(), DBOptions(opt), {"default"},
                                   {ColumnFamilyOptions(opt)}, kOptionsFileName,
                                   opt.env->GetFileSystem().get()));
 
@@ -166,7 +166,7 @@ TEST_F(DBBenchTest, OptionsFileMultiLevelUniversal) {
 
   Options opt = GetDefaultOptions(kCompactionStyleUniversal, 12);
 
-  ASSERT_OK(PersistRocksDBOptions(DBOptions(opt), {"default"},
+  ASSERT_OK(PersistRocksDBOptions(WriteOptions(), DBOptions(opt), {"default"},
                                   {ColumnFamilyOptions(opt)}, kOptionsFileName,
                                   opt.env->GetFileSystem().get()));
 
@@ -222,7 +222,6 @@ const std::string options_file_content = R"OPTIONS_FILE(
   stats_dump_period_sec=600
   allow_fallocate=true
   max_log_file_size=83886080
-  random_access_max_buffer_size=1048576
   advise_random_on_open=true
   dump_malloc_stats=true
 

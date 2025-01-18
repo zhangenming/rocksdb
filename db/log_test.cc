@@ -19,8 +19,7 @@
 #include "util/random.h"
 #include "utilities/memory_allocators.h"
 
-namespace ROCKSDB_NAMESPACE {
-namespace log {
+namespace ROCKSDB_NAMESPACE::log {
 
 // Construct a string of the specified length made out of the supplied
 // partial string.
@@ -185,9 +184,10 @@ class LogTest
   void Write(const std::string& msg,
              const UnorderedMap<uint32_t, size_t>* cf_to_ts_sz = nullptr) {
     if (cf_to_ts_sz != nullptr && !cf_to_ts_sz->empty()) {
-      ASSERT_OK(writer_->MaybeAddUserDefinedTimestampSizeRecord(*cf_to_ts_sz));
+      ASSERT_OK(writer_->MaybeAddUserDefinedTimestampSizeRecord(WriteOptions(),
+                                                                *cf_to_ts_sz));
     }
-    ASSERT_OK(writer_->AddRecord(Slice(msg)));
+    ASSERT_OK(writer_->AddRecord(WriteOptions(), Slice(msg)));
   }
 
   size_t WrittenBytes() const { return dest_contents().size(); }
@@ -436,6 +436,17 @@ TEST_P(LogTest, BadRecordType) {
   ASSERT_EQ("OK", MatchError("unknown record type"));
 }
 
+TEST_P(LogTest, IgnorableRecordType) {
+  Write("foo");
+  // Type is stored in header[6]
+  SetByte(6, static_cast<char>(kRecordTypeSafeIgnoreMask + 100));
+  FixChecksum(0, 3, false);
+  ASSERT_EQ("EOF", Read());
+  // The new type has value 129 and masked to be ignorable if unknown
+  ASSERT_EQ(0U, DroppedBytes());
+  ASSERT_EQ("", ReportMessage());
+}
+
 TEST_P(LogTest, TruncatedTrailingRecordIsIgnored) {
   Write("foo");
   ShrinkSize(4);  // Drop all payload as well as a header byte
@@ -454,7 +465,7 @@ TEST_P(LogTest, TruncatedTrailingRecordIsNotIgnored) {
   Write("foo");
   ShrinkSize(4);  // Drop all payload as well as a header byte
   ASSERT_EQ("EOF", Read(WALRecoveryMode::kAbsoluteConsistency));
-  // Truncated last record is ignored, not treated as an error
+  // Truncated last record is not ignored, treated as an error
   ASSERT_GT(DroppedBytes(), 0U);
   ASSERT_EQ("OK", MatchError("Corruption: truncated header"));
 }
@@ -732,8 +743,8 @@ TEST_P(LogTest, Recycle) {
   std::unique_ptr<WritableFileWriter> dest_holder(new WritableFileWriter(
       std::move(sink), "" /* don't care */, FileOptions()));
   Writer recycle_writer(std::move(dest_holder), 123, true);
-  ASSERT_OK(recycle_writer.AddRecord(Slice("foooo")));
-  ASSERT_OK(recycle_writer.AddRecord(Slice("bar")));
+  ASSERT_OK(recycle_writer.AddRecord(WriteOptions(), Slice("foooo")));
+  ASSERT_OK(recycle_writer.AddRecord(WriteOptions(), Slice("bar")));
   ASSERT_GE(get_reader_contents()->size(), log::kBlockSize * 2);
   ASSERT_EQ("foooo", Read());
   ASSERT_EQ("bar", Read());
@@ -764,13 +775,40 @@ TEST_P(LogTest, RecycleWithTimestampSize) {
   UnorderedMap<uint32_t, size_t> ts_sz_two = {
       {2, sizeof(uint64_t)},
   };
-  ASSERT_OK(recycle_writer.MaybeAddUserDefinedTimestampSizeRecord(ts_sz_two));
-  ASSERT_OK(recycle_writer.AddRecord(Slice("foooo")));
-  ASSERT_OK(recycle_writer.AddRecord(Slice("bar")));
+  ASSERT_OK(recycle_writer.MaybeAddUserDefinedTimestampSizeRecord(
+      WriteOptions(), ts_sz_two));
+  ASSERT_OK(recycle_writer.AddRecord(WriteOptions(), Slice("foooo")));
+  ASSERT_OK(recycle_writer.AddRecord(WriteOptions(), Slice("bar")));
   ASSERT_GE(get_reader_contents()->size(), log::kBlockSize * 2);
   CheckRecordAndTimestampSize("foooo", ts_sz_two);
   CheckRecordAndTimestampSize("bar", ts_sz_two);
   ASSERT_EQ("EOF", Read());
+}
+
+// Validates that `MaybeAddUserDefinedTimestampSizeRecord`` adds padding to the
+// tail of a block and switches to a new block, if there's not enough space for
+// the record.
+TEST_P(LogTest, TimestampSizeRecordPadding) {
+  bool recyclable_log = (std::get<0>(GetParam()) != 0);
+  const size_t header_size =
+      recyclable_log ? kRecyclableHeaderSize : kHeaderSize;
+  const size_t data_len = kBlockSize - 2 * header_size;
+
+  const auto first_str = BigString("foo", data_len);
+  Write(first_str);
+
+  UnorderedMap<uint32_t, size_t> ts_sz = {
+      {2, sizeof(uint64_t)},
+  };
+  ASSERT_OK(
+      writer_->MaybeAddUserDefinedTimestampSizeRecord(WriteOptions(), ts_sz));
+  ASSERT_LT(writer_->TEST_block_offset(), kBlockSize);
+
+  const auto second_str = BigString("bar", 1000);
+  Write(second_str);
+
+  ASSERT_EQ(first_str, Read());
+  CheckRecordAndTimestampSize(second_str, ts_sz);
 }
 
 // Do NOT enable compression for this instantiation.
@@ -853,12 +891,12 @@ class RetriableLogTest : public ::testing::TestWithParam<int> {
   std::string contents() { return sink_->contents_; }
 
   void Encode(const std::string& msg) {
-    ASSERT_OK(log_writer_->AddRecord(Slice(msg)));
+    ASSERT_OK(log_writer_->AddRecord(WriteOptions(), Slice(msg)));
   }
 
   void Write(const Slice& data) {
-    ASSERT_OK(writer_->Append(data));
-    ASSERT_OK(writer_->Sync(true));
+    ASSERT_OK(writer_->Append(IOOptions(), data));
+    ASSERT_OK(writer_->Sync(IOOptions(), true));
   }
 
   bool TryRead(std::string* result) {
@@ -991,7 +1029,9 @@ INSTANTIATE_TEST_CASE_P(bool, RetriableLogTest, ::testing::Values(0, 2));
 
 class CompressionLogTest : public LogTest {
  public:
-  Status SetupTestEnv() { return writer_->AddCompressionTypeRecord(); }
+  Status SetupTestEnv() {
+    return writer_->AddCompressionTypeRecord(WriteOptions());
+  }
 };
 
 TEST_P(CompressionLogTest, Empty) {
@@ -1109,7 +1149,7 @@ TEST_P(CompressionLogTest, AlignedFragmentation) {
   // beginning of the block.
   while ((WrittenBytes() & (kBlockSize - 1)) >= kHeaderSize) {
     char entry = 'a';
-    ASSERT_OK(writer_->AddRecord(Slice(&entry, 1)));
+    ASSERT_OK(writer_->AddRecord(WriteOptions(), Slice(&entry, 1)));
     num_filler_records++;
   }
   const std::vector<std::string> wal_entries = {
@@ -1126,6 +1166,42 @@ TEST_P(CompressionLogTest, AlignedFragmentation) {
     ASSERT_EQ(wal_entry, Read());
   }
   ASSERT_EQ("EOF", Read());
+}
+
+TEST_P(CompressionLogTest, ChecksumMismatch) {
+  const CompressionType kCompressionType = std::get<2>(GetParam());
+  const bool kCompressionEnabled = kCompressionType != kNoCompression;
+  const bool kRecyclableLog = (std::get<0>(GetParam()) != 0);
+  if (!StreamingCompressionTypeSupported(kCompressionType)) {
+    ROCKSDB_GTEST_SKIP("Test requires support for compression type");
+    return;
+  }
+  ASSERT_OK(SetupTestEnv());
+
+  Write("foooooo");
+  int header_len;
+  if (kRecyclableLog) {
+    header_len = kRecyclableHeaderSize;
+  } else {
+    header_len = kHeaderSize;
+  }
+  int compression_record_len;
+  if (kCompressionEnabled) {
+    compression_record_len = header_len + 4;
+  } else {
+    compression_record_len = 0;
+  }
+  IncrementByte(compression_record_len + header_len /* offset */,
+                14 /* delta */);
+
+  ASSERT_EQ("EOF", Read());
+  if (!kRecyclableLog) {
+    ASSERT_GT(DroppedBytes(), 0U);
+    ASSERT_EQ("OK", MatchError("checksum mismatch"));
+  } else {
+    ASSERT_EQ(0U, DroppedBytes());
+    ASSERT_EQ("", ReportMessage());
+  }
 }
 
 INSTANTIATE_TEST_CASE_P(
@@ -1202,8 +1278,7 @@ INSTANTIATE_TEST_CASE_P(
                                          kBlockSize * 2),
                        ::testing::Values(CompressionType::kZSTD)));
 
-}  // namespace log
-}  // namespace ROCKSDB_NAMESPACE
+}  // namespace ROCKSDB_NAMESPACE::log
 
 int main(int argc, char** argv) {
   ROCKSDB_NAMESPACE::port::InstallStackTraceHandler();

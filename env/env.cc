@@ -355,6 +355,12 @@ class LegacyDirectoryWrapper : public FSDirectory {
   std::unique_ptr<Directory> target_;
 };
 
+// A helper class to make legacy `Env` implementations be backward compatible
+// now that all `Env` implementations are expected to have a `FileSystem` type
+// member `file_system_` and a `SystemClock` type member `clock_`.
+// This class wraps a legacy `Env` object and expose its file system related
+// APIs as a `FileSystem` interface. Also check `LegacySystemClock` that does
+// the same thing for the clock related APIs.
 class LegacyFileSystemWrapper : public FileSystem {
  public:
   // Initialize an EnvWrapper that delegates all calls to *t
@@ -605,6 +611,7 @@ class LegacyFileSystemWrapper : public FileSystem {
     // would be part of the Env.  As such, do not serialize it here.
     return "";
   }
+
  private:
   Env* target_;
 };
@@ -824,6 +831,15 @@ RandomAccessFile::~RandomAccessFile() = default;
 WritableFile::~WritableFile() = default;
 
 MemoryMappedFileBuffer::~MemoryMappedFileBuffer() = default;
+
+// This const variable can be used in public headers without introducing the
+// possibility of ODR violations due to varying macro definitions.
+const InfoLogLevel Logger::kDefaultLogLevel =
+#ifdef NDEBUG
+    INFO_LEVEL;
+#else
+    DEBUG_LEVEL;
+#endif  // NDEBUG
 
 Logger::~Logger() = default;
 
@@ -1051,9 +1067,10 @@ void Log(const std::shared_ptr<Logger>& info_log, const char* format, ...) {
 }
 
 Status WriteStringToFile(Env* env, const Slice& data, const std::string& fname,
-                         bool should_sync) {
+                         bool should_sync, const IOOptions* io_options) {
   const auto& fs = env->GetFileSystem();
-  return WriteStringToFile(fs.get(), data, fname, should_sync);
+  return WriteStringToFile(fs.get(), data, fname, should_sync,
+                           io_options ? *io_options : IOOptions());
 }
 
 Status ReadFileToString(Env* env, const std::string& fname, std::string* data) {
@@ -1070,8 +1087,6 @@ void AssignEnvOptions(EnvOptions* env_options, const DBOptions& options) {
   env_options->set_fd_cloexec = options.is_fd_close_on_exec;
   env_options->bytes_per_sync = options.bytes_per_sync;
   env_options->compaction_readahead_size = options.compaction_readahead_size;
-  env_options->random_access_max_buffer_size =
-      options.random_access_max_buffer_size;
   env_options->rate_limiter = options.rate_limiter.get();
   env_options->writable_file_max_buffer_size =
       options.writable_file_max_buffer_size;

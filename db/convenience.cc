@@ -4,7 +4,6 @@
 //  (found in the LICENSE.Apache file in the root directory).
 //
 
-
 #include "rocksdb/convenience.h"
 
 #include "db/convenience_impl.h"
@@ -34,7 +33,7 @@ Status DeleteFilesInRanges(DB* db, ColumnFamilyHandle* column_family,
 Status VerifySstFileChecksum(const Options& options,
                              const EnvOptions& env_options,
                              const std::string& file_path) {
-  // TODO: plumb Env::IOActivity
+  // TODO: plumb Env::IOActivity, Env::IOPriority
   const ReadOptions read_options;
   return VerifySstFileChecksum(options, env_options, read_options, file_path);
 }
@@ -71,6 +70,9 @@ Status VerifySstFileChecksumInternal(const Options& options,
   } else {
     return s;
   }
+  if (!s.ok()) {
+    return s;
+  }
   std::unique_ptr<TableReader> table_reader;
   std::unique_ptr<RandomAccessFileReader> file_reader(
       new RandomAccessFileReader(
@@ -84,7 +86,7 @@ Status VerifySstFileChecksumInternal(const Options& options,
       options.block_protection_bytes_per_key, false /* skip_filters */,
       !kImmortal, false /* force_direct_prefetch */, -1 /* level */);
   reader_options.largest_seqno = largest_seqno;
-  s = ioptions.table_factory->NewTableReader(
+  s = options.table_factory->NewTableReader(
       read_options, reader_options, std::move(file_reader), file_size,
       &table_reader, false /* prefetch_index_and_filter_in_cache */);
   if (!s.ok()) {

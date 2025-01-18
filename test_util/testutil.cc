@@ -34,8 +34,7 @@
 void RegisterCustomObjects(int /*argc*/, char** /*argv*/) {}
 #endif
 
-namespace ROCKSDB_NAMESPACE {
-namespace test {
+namespace ROCKSDB_NAMESPACE::test {
 
 const uint32_t kDefaultFormatVersion = BlockBasedTableOptions().format_version;
 const std::set<uint32_t> kFooterFormatVersionsToTest{
@@ -47,6 +46,7 @@ const std::set<uint32_t> kFooterFormatVersionsToTest{
     kDefaultFormatVersion,
     kLatestFormatVersion,
 };
+const ReadOptionsNoIo kReadOptionsNoIo;
 
 std::string RandomKey(Random* rnd, int len, RandomKeyType type) {
   // Make sure to generate a wide variety of characters so we
@@ -91,8 +91,8 @@ bool ShouldPersistUDT(const UserDefinedTimestampTestMode& test_mode) {
   return test_mode != UserDefinedTimestampTestMode::kStripUserDefinedTimestamp;
 }
 
-extern Slice CompressibleString(Random* rnd, double compressed_fraction,
-                                int len, std::string* dst) {
+Slice CompressibleString(Random* rnd, double compressed_fraction, int len,
+                         std::string* dst) {
   int raw = static_cast<int>(len * compressed_fraction);
   if (raw < 1) {
     raw = 1;
@@ -308,6 +308,7 @@ void RandomInitDBOptions(DBOptions* db_opt, Random* rnd) {
   db_opt->is_fd_close_on_exec = rnd->Uniform(2);
   db_opt->paranoid_checks = rnd->Uniform(2);
   db_opt->track_and_verify_wals_in_manifest = rnd->Uniform(2);
+  db_opt->track_and_verify_wals = rnd->Uniform(2);
   db_opt->verify_sst_unique_id_in_manifest = rnd->Uniform(2);
   db_opt->skip_stats_update_on_db_open = rnd->Uniform(2);
   db_opt->skip_checking_sst_file_sizes_on_db_open = rnd->Uniform(2);
@@ -370,6 +371,7 @@ void RandomInitCFOptions(ColumnFamilyOptions* cf_opt, DBOptions& db_options,
   cf_opt->memtable_whole_key_filtering = rnd->Uniform(2);
   cf_opt->enable_blob_files = rnd->Uniform(2);
   cf_opt->enable_blob_garbage_collection = rnd->Uniform(2);
+  cf_opt->strict_max_successive_merges = rnd->Uniform(2);
 
   // double options
   cf_opt->memtable_prefix_bloom_size_ratio =
@@ -463,15 +465,16 @@ bool IsPrefetchSupported(const std::shared_ptr<FileSystem>& fs,
   Random rnd(301);
   std::string test_string = rnd.RandomString(4096);
   Slice data(test_string);
-  Status s = WriteStringToFile(fs.get(), data, tmp, true);
+  IOOptions opts;
+  Status s = WriteStringToFile(fs.get(), data, tmp, true, opts);
   if (s.ok()) {
     std::unique_ptr<FSRandomAccessFile> file;
     auto io_s = fs->NewRandomAccessFile(tmp, FileOptions(), &file, nullptr);
     if (io_s.ok()) {
-      supported = !(file->Prefetch(0, data.size(), IOOptions(), nullptr)
-                        .IsNotSupported());
+      supported =
+          !(file->Prefetch(0, data.size(), opts, nullptr).IsNotSupported());
     }
-    s = fs->DeleteFile(tmp, IOOptions(), nullptr);
+    s = fs->DeleteFile(tmp, opts, nullptr);
   }
   return s.ok() && supported;
 }
@@ -521,7 +524,7 @@ Status CorruptFile(Env* env, const std::string& fname, int offset,
     for (int i = 0; i < bytes_to_corrupt; i++) {
       contents[i + offset] ^= 0x80;
     }
-    s = WriteStringToFile(env, contents, fname);
+    s = WriteStringToFile(env, contents, fname, false /* should_sync */);
   }
   if (s.ok() && verify_checksum) {
     Options options;
@@ -544,7 +547,7 @@ Status TruncateFile(Env* env, const std::string& fname, uint64_t new_length) {
   s = ReadFileToString(env, fname, &contents);
   if (s.ok()) {
     contents.resize(static_cast<size_t>(new_length), 'b');
-    s = WriteStringToFile(env, contents, fname);
+    s = WriteStringToFile(env, contents, fname, false /* should_sync */);
   }
   return s;
 }
@@ -562,6 +565,30 @@ Status TryDeleteDir(Env* env, const std::string& dirname) {
 // Delete a directory if it exists
 void DeleteDir(Env* env, const std::string& dirname) {
   TryDeleteDir(env, dirname).PermitUncheckedError();
+}
+
+FileType GetFileType(const std::string& path) {
+  FileType type = kTempFile;
+  std::size_t found = path.find_last_of('/');
+  if (found == std::string::npos) {
+    found = 0;
+  }
+  std::string file_name = path.substr(found);
+  uint64_t number = 0;
+  ParseFileName(file_name, &number, &type);
+  return type;
+}
+
+uint64_t GetFileNumber(const std::string& path) {
+  FileType type = kTempFile;
+  std::size_t found = path.find_last_of('/');
+  if (found == std::string::npos) {
+    found = 0;
+  }
+  std::string file_name = path.substr(found);
+  uint64_t number = 0;
+  ParseFileName(file_name, &number, &type);
+  return number;
 }
 
 Status CreateEnvFromSystem(const ConfigOptions& config_options, Env** result,
@@ -590,13 +617,13 @@ class SpecialMemTableRep : public MemTableRep {
         num_entries_flush_(num_entries_flush),
         num_entries_(0) {}
 
-  virtual KeyHandle Allocate(const size_t len, char** buf) override {
+  KeyHandle Allocate(const size_t len, char** buf) override {
     return memtable_->Allocate(len, buf);
   }
 
   // Insert key into the list.
   // REQUIRES: nothing that compares equal to key is currently in the list.
-  virtual void Insert(KeyHandle handle) override {
+  void Insert(KeyHandle handle) override {
     num_entries_++;
     memtable_->Insert(handle);
   }
@@ -607,19 +634,18 @@ class SpecialMemTableRep : public MemTableRep {
   }
 
   // Returns true iff an entry that compares equal to key is in the list.
-  virtual bool Contains(const char* key) const override {
+  bool Contains(const char* key) const override {
     return memtable_->Contains(key);
   }
 
-  virtual size_t ApproximateMemoryUsage() override {
+  size_t ApproximateMemoryUsage() override {
     // Return a high memory usage when number of entries exceeds the threshold
     // to trigger a flush.
     return (num_entries_ < num_entries_flush_) ? 0 : 1024 * 1024 * 1024;
   }
 
-  virtual void Get(const LookupKey& k, void* callback_args,
-                   bool (*callback_func)(void* arg,
-                                         const char* entry)) override {
+  void Get(const LookupKey& k, void* callback_args,
+           bool (*callback_func)(void* arg, const char* entry)) override {
     memtable_->Get(k, callback_args, callback_func);
   }
 
@@ -628,11 +654,11 @@ class SpecialMemTableRep : public MemTableRep {
     return memtable_->ApproximateNumEntries(start_ikey, end_ikey);
   }
 
-  virtual MemTableRep::Iterator* GetIterator(Arena* arena = nullptr) override {
+  MemTableRep::Iterator* GetIterator(Arena* arena = nullptr) override {
     return memtable_->GetIterator(arena);
   }
 
-  virtual ~SpecialMemTableRep() override = default;
+  ~SpecialMemTableRep() override = default;
 
  private:
   std::unique_ptr<MemTableRep> memtable_;
@@ -664,16 +690,17 @@ class SpecialSkipListFactory : public MemTableRepFactory {
       : num_entries_flush_(num_entries_flush) {}
 
   using MemTableRepFactory::CreateMemTableRep;
-  virtual MemTableRep* CreateMemTableRep(
-      const MemTableRep::KeyComparator& compare, Allocator* allocator,
-      const SliceTransform* transform, Logger* /*logger*/) override {
+  MemTableRep* CreateMemTableRep(const MemTableRep::KeyComparator& compare,
+                                 Allocator* allocator,
+                                 const SliceTransform* transform,
+                                 Logger* /*logger*/) override {
     return new SpecialMemTableRep(
         allocator,
         factory_.CreateMemTableRep(compare, allocator, transform, nullptr),
         num_entries_flush_);
   }
   static const char* kClassName() { return "SpecialSkipListFactory"; }
-  virtual const char* Name() const override { return kClassName(); }
+  const char* Name() const override { return kClassName(); }
   std::string GetId() const override {
     std::string id = Name();
     if (num_entries_flush_ > 0) {
@@ -739,7 +766,6 @@ int RegisterTestObjects(ObjectLibrary& library, const std::string& arg) {
   return static_cast<int>(library.GetFactoryCount(&num_types));
 }
 
-
 void RegisterTestLibrary(const std::string& arg) {
   static bool registered = false;
   if (!registered) {
@@ -747,5 +773,6 @@ void RegisterTestLibrary(const std::string& arg) {
     ObjectRegistry::Default()->AddLibrary("test", RegisterTestObjects, arg);
   }
 }
-}  // namespace test
-}  // namespace ROCKSDB_NAMESPACE
+
+const std::string kUnitTestDbId = "UnitTest";
+}  // namespace ROCKSDB_NAMESPACE::test
