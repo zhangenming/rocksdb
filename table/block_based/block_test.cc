@@ -576,10 +576,14 @@ TEST_F(BlockTest, ReadAmpBitmapPow2) {
   ASSERT_EQ(BlockReadAmpBitmap(100, 35, stats.get()).GetBytesPerBit(), 32u);
 }
 
+enum class KeyDistribution { kUniform, kNonUniform };
+
 class IndexBlockTest
     : public testing::Test,
       public testing::WithParamInterface<
-          std::tuple<bool, bool, bool, test::UserDefinedTimestampTestMode>> {
+          std::tuple<bool, bool, bool, test::UserDefinedTimestampTestMode,
+                     BlockBasedTableOptions::BlockSearchType, int, int, int,
+                     int, KeyDistribution>> {
  public:
   IndexBlockTest() = default;
 
@@ -592,25 +596,52 @@ class IndexBlockTest
   bool shouldPersistUDT() const {
     return test::ShouldPersistUDT(std::get<3>(GetParam()));
   }
+  BlockBasedTableOptions::BlockSearchType indexSearchType() const {
+    return isUDTEnabled() ? BlockBasedTableOptions::kBinary
+                          : std::get<4>(GetParam());
+  }
+  int numRecords() const {
+    return std::min(1 << keyLength(), std::get<5>(GetParam()));
+  }
+  int indexBlockRestartInterval() const { return std::get<6>(GetParam()); }
+  int keyLength() const { return std::get<7>(GetParam()); }
+  int prefixLength() const { return std::get<8>(GetParam()); }
+  KeyDistribution keyDistribution() const { return std::get<9>(GetParam()); }
 };
 
-// Similar to GenerateRandomKVs but for index block contents.
-void GenerateRandomIndexEntries(std::vector<std::string>* separators,
-                                std::vector<BlockHandle>* block_handles,
-                                std::vector<std::string>* first_keys,
-                                const int len, size_t ts_sz = 0,
-                                bool zero_seqno = false) {
+// Similar to GenerateRandomKVs but for index block contents. Keys always
+// contain a 0-sequence number, callers may extract the user key if needed.
+void GenerateRandomIndexEntries(
+    std::vector<std::string>* separators,
+    std::vector<BlockHandle>* block_handles,
+    std::vector<std::string>* first_keys, const int len, size_t ts_sz = 0,
+    int key_length = 12, int prefix_length = 0,
+    KeyDistribution distribution = KeyDistribution::kUniform) {
   Random rnd(42);
+  std::string prefix(prefix_length, 'x');
 
   // For each of `len` blocks, we need to generate a first and last key.
-  // Let's generate n*2 random keys, sort them, group into consecutive pairs.
+  // Generate n*2 random keys, sort them, group into consecutive pairs.
   std::set<std::string> keys;
+
+  // Two clusters with shared prefixes of effective_key_length - 2. This
+  // stresses interpolation search's uniform distribution assumption.
+  int cluster_prefix_len = std::max(0, key_length - 5);
+  std::string cluster1_prefix = prefix + rnd.RandomString(cluster_prefix_len);
+  std::string cluster2_prefix = prefix + rnd.RandomString(cluster_prefix_len);
+
   while ((int)keys.size() < len * 2) {
-    // Keys need to be at least 8 bytes long to look like internal keys.
-    std::string new_key = test::RandomKey(&rnd, 12);
-    if (zero_seqno) {
-      AppendInternalKeyFooter(&new_key, 0 /* seqno */, kTypeValue);
+    std::string new_key;
+    if (distribution == KeyDistribution::kNonUniform) {
+      int remaining = key_length - cluster_prefix_len;
+      const std::string& cp =
+          (keys.size() % 2 == 0) ? cluster1_prefix : cluster2_prefix;
+      new_key = cp + rnd.RandomString(std::max(1, remaining));
+    } else {
+      new_key = prefix + test::RandomKey(&rnd, key_length);
     }
+
+    AppendInternalKeyFooter(&new_key, 0 /* seqno */, kTypeValue);
     if (ts_sz > 0) {
       std::string key;
       PadInternalKeyWithMinTimestamp(&key, new_key, ts_sz);
@@ -643,15 +674,17 @@ TEST_P(IndexBlockTest, IndexValueEncodingTest) {
   std::vector<BlockHandle> block_handles;
   std::vector<std::string> first_keys;
   const bool kUseDeltaEncoding = true;
-  BlockBuilder builder(16, kUseDeltaEncoding, useValueDeltaEncoding(),
+  BlockBuilder builder(indexBlockRestartInterval(), kUseDeltaEncoding,
+                       useValueDeltaEncoding(),
                        BlockBasedTableOptions::kDataBlockBinarySearch,
                        0.75 /* data_block_hash_table_util_ratio */, ts_sz,
                        shouldPersistUDT(), !keyIncludesSeq());
 
-  int num_records = 100;
+  int num_records = numRecords();
 
   GenerateRandomIndexEntries(&separators, &block_handles, &first_keys,
-                             num_records, ts_sz, false /* zero_seqno */);
+                             num_records, ts_sz, keyLength(), prefixLength(),
+                             keyDistribution());
   BlockHandle last_encoded_handle;
   for (int i = 0; i < num_records; i++) {
     std::string first_key_to_persist_buf;
@@ -696,7 +729,7 @@ TEST_P(IndexBlockTest, IndexValueEncodingTest) {
       options.comparator, kDisableGlobalSequenceNumber, kNullIter, kNullStats,
       kTotalOrderSeek, includeFirstKey(), keyIncludesSeq(),
       !useValueDeltaEncoding(), false /* block_contents_pinned */,
-      shouldPersistUDT());
+      shouldPersistUDT(), nullptr /* prefix_index */, indexSearchType());
   iter->SeekToFirst();
   for (int index = 0; index < num_records; ++index) {
     ASSERT_TRUE(iter->Valid());
@@ -724,7 +757,7 @@ TEST_P(IndexBlockTest, IndexValueEncodingTest) {
       options.comparator, kDisableGlobalSequenceNumber, kNullIter, kNullStats,
       kTotalOrderSeek, includeFirstKey(), keyIncludesSeq(),
       !useValueDeltaEncoding(), false /* block_contents_pinned */,
-      shouldPersistUDT());
+      shouldPersistUDT(), nullptr /* prefix_index */, indexSearchType());
   for (int i = 0; i < num_records * 2; i++) {
     // find a random key in the lookaside array
     int index = rnd.Uniform(num_records);
@@ -753,10 +786,26 @@ TEST_P(IndexBlockTest, IndexValueEncodingTest) {
 // Param 1: use value delta encoding
 // Param 2: include first key
 // Param 3: user-defined timestamp test mode
+// Param 4: index search type (binary search or interpolation search)
+// Param 5: number of records
+// Param 6: index block restart interval
+// Param 7: key length
+// Param 8: prefix length
+// Param 9: key distribution (uniform or non-uniform)
 INSTANTIATE_TEST_CASE_P(
     P, IndexBlockTest,
-    ::testing::Combine(::testing::Bool(), ::testing::Bool(), ::testing::Bool(),
-                       ::testing::ValuesIn(test::GetUDTTestModes())));
+    ::testing::Combine(
+        ::testing::Bool(), ::testing::Bool(), ::testing::Bool(),
+        ::testing::ValuesIn(test::GetUDTTestModes()),
+        ::testing::Values(
+            BlockBasedTableOptions::BlockSearchType::kBinary,
+            BlockBasedTableOptions::BlockSearchType::kInterpolation),
+        ::testing::Values(1, 100),    // num_records
+        ::testing::Values(1, 16),     // index_block_restart_interval
+        ::testing::Values(1, 8, 12),  // key_length
+        ::testing::Values(0, 50),     // prefix_length
+        ::testing::Values(KeyDistribution::kUniform,
+                          KeyDistribution::kNonUniform)));
 
 class BlockPerKVChecksumTest : public DBTestBase {
  public:
@@ -1259,8 +1308,7 @@ TEST_P(IndexBlockKVChecksumTest, ChecksumConstructionAndVerification) {
       std::vector<BlockHandle> block_handles;
       std::vector<std::string> first_keys;
       GenerateRandomIndexEntries(&separators, &block_handles, &first_keys,
-                                 kNumRecords, 0 /* ts_sz */,
-                                 seqno != kDisableGlobalSequenceNumber);
+                                 kNumRecords, 0 /* ts_sz */);
       SyncPoint::GetInstance()->DisableProcessing();
       std::unique_ptr<Block_kIndex> index_block = GenerateIndexBlock(
           separators, block_handles, first_keys, kNumRecords);
@@ -1558,8 +1606,7 @@ TEST_P(IndexBlockKVChecksumCorruptionTest, CorruptEntry) {
       std::vector<BlockHandle> block_handles;
       std::vector<std::string> first_keys;
       GenerateRandomIndexEntries(&separators, &block_handles, &first_keys,
-                                 kNumRecords, 0 /* ts_sz */,
-                                 seqno != kDisableGlobalSequenceNumber);
+                                 kNumRecords, 0 /* ts_sz */);
       SyncPoint::GetInstance()->SetCallBack(
           "BlockIter::UpdateKey::value", [](void* arg) {
             char* value = static_cast<char*>(arg);
